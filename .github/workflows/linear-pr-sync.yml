@@ -37,17 +37,9 @@ jobs:
             }
 
             const eventLabel = action === "closed" && pr.merged ? "merged" : action;
-            const text = `${pr.title ?? ""}\n${pr.body ?? ""}`;
-            const identifiers = new Set();
-            for (const match of text.matchAll(/https:\/\/linear\.app\/[^/\s)]+\/issue\/([A-Z][A-Z0-9]+-\d+)(?:[/?#][^\s)]*)?/g)) {
-              identifiers.add(match[1].toUpperCase());
-            }
-            for (const match of text.matchAll(/\b[A-Z][A-Z0-9]+-\d+\b/g)) {
-              identifiers.add(match[0].toUpperCase());
-            }
-
-            if (identifiers.size === 0) {
-              console.log("No Linear issue identifiers found in PR title or body.");
+            const tickets = extractTickets(`${pr.title ?? ""}\n${pr.body ?? ""}`);
+            if (tickets.size === 0) {
+              console.log("No Linear tickets found in PR title or body.");
               return;
             }
 
@@ -112,7 +104,7 @@ jobs:
               );
             }
 
-            for (const identifier of [...identifiers].sort()) {
+            for (const [identifier, ticketUrl] of [...tickets.entries()].sort()) {
               const marker = `linear-pr-sync:${repository}#${pr.number}:${eventLabel}:${identifier}`;
               const issue = await fetchIssue(identifier);
               if (!issue) {
@@ -126,10 +118,36 @@ jobs:
               const body = [
                 `<!-- ${marker} -->`,
                 `GitHub PR ${eventLabel}: [${repository}#${pr.number}](${pr.html_url})`,
+                `Ticket: [${identifier}](${ticketUrl})`,
               ].join("\n");
               await createComment(issue.id, body);
               console.log(`Commented on Linear issue ${identifier}.`);
             }
+          }
+
+          function extractTickets(text) {
+            const tickets = new Map();
+            const ticketLinePattern = /^\s*Ticket\s*:\s*(https:\/\/linear\.app\/[^/\s)]+\/issue\/([A-Z][A-Z0-9]+-\d+)(?:[/?#][^\s)]*)?)/gim;
+            for (const match of text.matchAll(ticketLinePattern)) {
+              tickets.set(match[2].toUpperCase(), match[1]);
+            }
+            if (tickets.size > 0) {
+              return tickets;
+            }
+
+            const linearIssueUrlPattern = /https:\/\/linear\.app\/[^/\s)]+\/issue\/([A-Z][A-Z0-9]+-\d+)(?:[/?#][^\s)]*)?/g;
+            for (const match of text.matchAll(linearIssueUrlPattern)) {
+              tickets.set(match[1].toUpperCase(), match[0]);
+            }
+            if (tickets.size > 0) {
+              return tickets;
+            }
+
+            for (const match of text.matchAll(/\b[A-Z][A-Z0-9]+-\d+\b/g)) {
+              const identifier = match[0].toUpperCase();
+              tickets.set(identifier, `https://linear.app/anmho/issue/${identifier}`);
+            }
+            return tickets;
           }
 
           main().catch((error) => {

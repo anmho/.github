@@ -23,6 +23,13 @@ jobs:
       LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
 ```
 
-The workflow extracts Linear identifiers such as `ANM-123` from the PR title or
-body, including `linear.app` issue links, and posts an idempotent comment with
-the PR URL.
+PRs should include an explicit ticket line in the body:
+
+```md
+Ticket: https://linear.app/anmho/issue/ANM-123
+```
+
+The workflow prefers `Ticket: <linear.app issue URL>` lines, preserves that
+actual ticket URL in the Linear comment, and posts an idempotent comment with
+the PR URL. Plain `linear.app` issue links and bare issue identifiers are kept
+as fallback detection only.
