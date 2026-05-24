@@ -35,6 +35,10 @@ jobs:
             if (!repository || !pr?.number || !pr.html_url) {
               throw new Error("invalid_pull_request_event_payload");
             }
+            if (!["opened", "reopened", "closed"].includes(action)) {
+              console.log(`Pull request action ${action} does not create a Linear comment.`);
+              return;
+            }
 
             const eventLabel = action === "closed" && pr.merged ? "merged" : action;
             const tickets = extractTickets(`${pr.title ?? ""}\n${pr.body ?? ""}`);
@@ -105,21 +109,21 @@ jobs:
             }
 
             for (const [identifier, ticketUrl] of [...tickets.entries()].sort()) {
-              const marker = `linear-pr-sync:${repository}#${pr.number}:${eventLabel}:${identifier}`;
               const issue = await fetchIssue(identifier);
               if (!issue) {
                 console.log(`Linear issue ${identifier} was not found; skipping.`);
                 continue;
               }
-              if (issue.comments.some((body) => body.includes(marker))) {
-                console.log(`Linear issue ${identifier} already has ${marker}; skipping.`);
+              const prLine = `GitHub PR ${eventLabel}: [${repository}#${pr.number}](${pr.html_url})`;
+              const ticketLine = `Ticket: [${identifier}](${ticketUrl})`;
+              const body = [
+                prLine,
+                ticketLine,
+              ].join("\n");
+              if (issue.comments.some((comment) => comment.trim() === body)) {
+                console.log(`Linear issue ${identifier} already has PR ${eventLabel} comment for ${repository}#${pr.number}; skipping.`);
                 continue;
               }
-              const body = [
-                `<!-- ${marker} -->`,
-                `GitHub PR ${eventLabel}: [${repository}#${pr.number}](${pr.html_url})`,
-                `Ticket: [${identifier}](${ticketUrl})`,
-              ].join("\n");
               await createComment(issue.id, body);
               console.log(`Commented on Linear issue ${identifier}.`);
             }

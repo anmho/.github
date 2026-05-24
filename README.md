@@ -14,7 +14,7 @@ name: Linear PR Sync
 
 on:
   pull_request:
-    types: [opened, edited, reopened, closed]
+    types: [opened, reopened, closed]
 
 jobs:
   linear-pr-sync:
