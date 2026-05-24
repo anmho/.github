@@ -2,24 +2,55 @@ name: Linear PR Sync
 
 on:
   workflow_call:
+    inputs:
+      review_state:
+        description: Linear state for PRs ready for human review.
+        required: false
+        type: string
+        default: In Review
+      merged_state:
+        description: Linear state for merged PRs.
+        required: false
+        type: string
+        default: Done
+      changes_requested_state:
+        description: Linear state for PRs with requested changes.
+        required: false
+        type: string
+        default: In Progress
     secrets:
       LINEAR_API_KEY:
         required: true
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: read
 
 jobs:
   comment-linear:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
       - name: Comment on linked Linear issues
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LINEAR_REVIEW_STATE: ${{ inputs.review_state }}
+          LINEAR_MERGED_STATE: ${{ inputs.merged_state }}
+          LINEAR_CHANGES_REQUESTED_STATE: ${{ inputs.changes_requested_state }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           node <<'NODE'
           const { readFileSync } = require("node:fs");
+          const PRIORITY_LABEL_PREFIX = "linear-priority:";
+          const PRIORITY_LABELS = {
+            urgent: { color: "b60205", description: "Linked Linear ticket priority: urgent" },
+            high: { color: "d93f0b", description: "Linked Linear ticket priority: high" },
+            normal: { color: "fbca04", description: "Linked Linear ticket priority: normal" },
+            low: { color: "0e8a16", description: "Linked Linear ticket priority: low" },
+            none: { color: "cfd3d7", description: "Linked Linear ticket priority: none" },
+          };
+          const PRIORITY_ORDER = ["urgent", "high", "normal", "low", "none"];
 
           async function main() {
             const apiKey = process.env.LINEAR_API_KEY;
@@ -30,22 +61,39 @@ jobs:
 
             const payload = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
             const action = payload.action;
+            const eventName = process.env.GITHUB_EVENT_NAME;
             const repository = payload.repository?.full_name;
             const pr = payload.pull_request;
             if (!repository || !pr?.number || !pr.html_url) {
               throw new Error("invalid_pull_request_event_payload");
             }
-            if (!["opened", "reopened", "closed"].includes(action)) {
+            const review = payload.review;
+            const isChangesRequestedReview =
+              eventName === "pull_request_review" &&
+              action === "submitted" &&
+              review?.state === "changes_requested";
+
+            if (eventName === "pull_request_review" && !isChangesRequestedReview) {
+              console.log(`Pull request review action ${action}/${review?.state ?? "unknown"} does not create a Linear comment.`);
+              return;
+            }
+            if (eventName === "pull_request" && !["opened", "reopened", "ready_for_review", "closed"].includes(action)) {
               console.log(`Pull request action ${action} does not create a Linear comment.`);
               return;
             }
 
-            const eventLabel = action === "closed" && pr.merged ? "merged" : action;
+            const eventLabel = isChangesRequestedReview
+              ? "changes requested"
+              : action === "closed" && pr.merged ? "merged" : action;
+            const targetState = isChangesRequestedReview
+              ? (process.env.LINEAR_CHANGES_REQUESTED_STATE ?? "In Progress").trim()
+              : targetStateForPullRequest(action, pr);
             const tickets = extractTickets(`${pr.title ?? ""}\n${pr.body ?? ""}`);
             if (tickets.size === 0) {
               console.log("No Linear tickets found in PR title or body.");
               return;
             }
+            const priorityNames = new Set();
 
             async function linearGraphql(query, variables) {
               const response = await fetch("https://api.linear.app/graphql", {
@@ -75,6 +123,9 @@ jobs:
                   query SharedLinearPrSyncIssue($identifier: String!) {
                     issue(id: $identifier) {
                       id
+                      priority
+                      team { id }
+                      state { name }
                       comments(first: 100) {
                         nodes { body }
                       }
@@ -89,6 +140,9 @@ jobs:
               }
               return {
                 id: issue.id,
+                priority: issue.priority ?? null,
+                teamId: issue.team?.id ?? null,
+                stateName: issue.state?.name ?? null,
                 comments: (issue.comments?.nodes ?? [])
                   .map((comment) => comment.body)
                   .filter(Boolean),
@@ -108,25 +162,221 @@ jobs:
               );
             }
 
+            async function fetchWorkflowStateId(teamId, stateName) {
+              const data = await linearGraphql(
+                `
+                  query SharedLinearPrSyncWorkflowStates($teamId: ID!) {
+                    workflowStates(filter: { team: { id: { eq: $teamId } } }, first: 100) {
+                      nodes { id name }
+                    }
+                  }
+                `,
+                { teamId },
+              );
+              const target = stateName.toLowerCase();
+              return (data.workflowStates?.nodes ?? []).find(
+                (state) => state.name?.toLowerCase() === target,
+              )?.id ?? null;
+            }
+
+            async function moveIssueToState(issue, identifier, stateName) {
+              if (!stateName) {
+                return;
+              }
+              if (issue.stateName?.toLowerCase() === stateName.toLowerCase()) {
+                console.log(`Linear issue ${identifier} is already in ${stateName}; skipping state sync.`);
+                return;
+              }
+              if (!issue.teamId) {
+                throw new Error(`linear_issue_team_not_found: ${identifier}`);
+              }
+              const stateId = await fetchWorkflowStateId(issue.teamId, stateName);
+              if (!stateId) {
+                throw new Error(`linear_state_not_found: ${stateName}`);
+              }
+              const update = await linearGraphql(
+                `
+                  mutation SharedLinearPrSyncIssueState($id: String!, $stateId: String!) {
+                    issueUpdate(id: $id, input: { stateId: $stateId }) {
+                      success
+                    }
+                  }
+                `,
+                { id: issue.id, stateId },
+              );
+              if (!update.issueUpdate?.success) {
+                throw new Error(`linear_issue_state_update_failed: ${identifier}`);
+              }
+              console.log(`Moved Linear issue ${identifier} to ${stateName}.`);
+            }
+
+            async function githubRequest(path, options = {}) {
+              const token = process.env.GITHUB_TOKEN;
+              if (!token) {
+                console.log("GITHUB_TOKEN is not set; skipping PR priority label sync.");
+                return null;
+              }
+              const response = await fetch(`https://api.github.com${path}`, {
+                ...options,
+                headers: {
+                  accept: "application/vnd.github+json",
+                  authorization: `Bearer ${token}`,
+                  "x-github-api-version": "2022-11-28",
+                  ...(options.headers ?? {}),
+                },
+              });
+              if (response.status === 404) {
+                return null;
+              }
+              if (!response.ok) {
+                throw new Error(`github_http_error: ${response.status} ${await response.text()}`);
+              }
+              if (response.status === 204) {
+                return null;
+              }
+              return response.json();
+            }
+
+            async function ensurePriorityLabel(repository, priority) {
+              const labelName = `${PRIORITY_LABEL_PREFIX}${priority}`;
+              const encodedName = encodeURIComponent(labelName);
+              const existing = await githubRequest(`/repos/${repository}/labels/${encodedName}`);
+              if (existing) {
+                return labelName;
+              }
+              const label = PRIORITY_LABELS[priority] ?? PRIORITY_LABELS.none;
+              await githubRequest(`/repos/${repository}/labels`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  name: labelName,
+                  color: label.color,
+                  description: label.description,
+                }),
+              });
+              return labelName;
+            }
+
+            async function syncPullRequestPriorityLabel(repository, prNumber, priority) {
+              if (!priority) {
+                return;
+              }
+              const labelName = await ensurePriorityLabel(repository, priority);
+              if (!labelName) {
+                return;
+              }
+              const issue = await githubRequest(`/repos/${repository}/issues/${prNumber}`);
+              const existingLabels = issue?.labels ?? [];
+              for (const label of existingLabels) {
+                const name = typeof label === "string" ? label : label.name;
+                if (!name?.startsWith(PRIORITY_LABEL_PREFIX) || name === labelName) {
+                  continue;
+                }
+                await githubRequest(`/repos/${repository}/issues/${prNumber}/labels/${encodeURIComponent(name)}`, {
+                  method: "DELETE",
+                });
+              }
+              if (!existingLabels.some((label) => (typeof label === "string" ? label : label.name) === labelName)) {
+                await githubRequest(`/repos/${repository}/issues/${prNumber}/labels`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ labels: [labelName] }),
+                });
+              }
+              console.log(`Synced PR priority label ${labelName}.`);
+            }
+
             for (const [identifier, ticketUrl] of [...tickets.entries()].sort()) {
               const issue = await fetchIssue(identifier);
               if (!issue) {
                 console.log(`Linear issue ${identifier} was not found; skipping.`);
                 continue;
               }
-              const prLine = `GitHub PR ${eventLabel}: [${repository}#${pr.number}](${pr.html_url})`;
-              const ticketLine = `Ticket: [${identifier}](${ticketUrl})`;
-              const body = [
-                prLine,
-                ticketLine,
-              ].join("\n");
+              priorityNames.add(priorityName(issue.priority));
+              const body = isChangesRequestedReview
+                ? reviewChangesRequestedBody({
+                    repository,
+                    pr,
+                    review,
+                    identifier,
+                    ticketUrl,
+                    priority: priorityName(issue.priority),
+                  })
+                : pullRequestEventBody({
+                    repository,
+                    pr,
+                    eventLabel,
+                    identifier,
+                    ticketUrl,
+                    priority: priorityName(issue.priority),
+                  });
               if (issue.comments.some((comment) => comment.trim() === body)) {
                 console.log(`Linear issue ${identifier} already has PR ${eventLabel} comment for ${repository}#${pr.number}; skipping.`);
-                continue;
+              } else {
+                await createComment(issue.id, body);
+                console.log(`Commented on Linear issue ${identifier}.`);
               }
-              await createComment(issue.id, body);
-              console.log(`Commented on Linear issue ${identifier}.`);
+              await moveIssueToState(issue, identifier, targetState);
             }
+            await syncPullRequestPriorityLabel(repository, pr.number, highestPriority(priorityNames));
+          }
+
+          function pullRequestEventBody({ repository, pr, eventLabel, identifier, ticketUrl, priority }) {
+            return [
+              `GitHub PR ${eventLabel}: [${repository}#${pr.number}](${pr.html_url})`,
+              `Ticket: [${identifier}](${ticketUrl})`,
+              `Priority: ${priority}`,
+            ].join("\n");
+          }
+
+          function reviewChangesRequestedBody({ repository, pr, review, identifier, ticketUrl, priority }) {
+            const lines = [
+              `GitHub review requested changes: [${repository}#${pr.number}](${review.html_url ?? pr.html_url})`,
+              `Ticket: [${identifier}](${ticketUrl})`,
+              `Priority: ${priority}`,
+            ];
+            const reviewer = review.user?.login;
+            if (reviewer) {
+              lines.push(`Reviewer: @${reviewer}`);
+            }
+            const feedback = (review.body ?? "").trim();
+            if (feedback) {
+              lines.push("", "Feedback:", blockquote(feedback));
+            }
+            return lines.join("\n");
+          }
+
+          function blockquote(text) {
+            return text.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
+          }
+
+          function targetStateForPullRequest(action, pr) {
+            if (action === "closed") {
+              return pr.merged ? (process.env.LINEAR_MERGED_STATE ?? "Done").trim() : "";
+            }
+            if (pr.draft) {
+              return "";
+            }
+            return (process.env.LINEAR_REVIEW_STATE ?? "In Review").trim();
+          }
+
+          function priorityName(priority) {
+            switch (priority) {
+              case 1: return "urgent";
+              case 2: return "high";
+              case 3: return "normal";
+              case 4: return "low";
+              default: return "none";
+            }
+          }
+
+          function highestPriority(priorities) {
+            for (const priority of PRIORITY_ORDER) {
+              if (priorities.has(priority)) {
+                return priority;
+              }
+            }
+            return "none";
           }
 
           function extractTickets(text) {
