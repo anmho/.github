@@ -14,7 +14,9 @@ name: Linear PR Sync
 
 on:
   pull_request:
-    types: [opened, reopened, closed]
+    types: [opened, reopened, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted]
 
 jobs:
   linear-pr-sync:
@@ -33,3 +35,34 @@ The workflow prefers `Ticket: <linear.app issue URL>` lines, preserves that
 actual ticket URL in the Linear comment, and posts an idempotent comment with
 the PR URL. Plain `linear.app` issue links and bare issue identifiers are kept
 as fallback detection only.
+
+The workflow also syncs Linear state from PR lifecycle:
+
+- `opened`, `reopened`, and `ready_for_review` move linked non-draft PR issues
+  to `In Review`.
+- GitHub reviews submitted as `changes_requested` move linked issues back to
+  `In Progress` so Symphony can pick up rework. Graphite review flows should
+  rely on the GitHub review event they create or mirror.
+- merged PRs move linked issues to `Done`.
+- closed unmerged PRs only comment; they do not change issue state.
+
+The workflow mirrors the highest linked Linear issue priority onto the PR with
+one of these labels: `linear-priority:urgent`, `linear-priority:high`,
+`linear-priority:normal`, `linear-priority:low`, or `linear-priority:none`.
+Review inboxes should use that label, or fetch Linear directly, when ordering
+agent handoffs for review.
+
+Override the target state names if a repository uses different Linear workflow
+states:
+
+```yaml
+jobs:
+  linear-pr-sync:
+    uses: anmho/.github/.github/workflows/linear-pr-sync.yml@main
+    with:
+      review_state: Human Review
+      changes_requested_state: Rework
+      merged_state: Done
+    secrets:
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+```
