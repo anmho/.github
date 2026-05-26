@@ -9,6 +9,14 @@ Maintained ANM repositories should use the shared Dependabot policy in
 template lives at
 [`templates/dependabot/maintained-repo.yml`](templates/dependabot/maintained-repo.yml).
 
+## Repository Defaults
+
+Maintained ANM repositories should allow squash merges only. The shared policy
+and verification commands live in
+[`docs/repository-defaults.md`](docs/repository-defaults.md), with the reusable
+settings template at
+[`templates/repository-settings/squash-only.yml`](templates/repository-settings/squash-only.yml).
+
 ## Reusable Workflows
 
 ### Linear PR Sync

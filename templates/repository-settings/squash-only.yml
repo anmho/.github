@@ -1,0 +1,11 @@
+repository:
+  merge_policy:
+    squash_merge_allowed: true
+    merge_commit_allowed: false
+    rebase_merge_allowed: false
+
+apply:
+  command: gh repo edit anmho/<repo> --enable-squash-merge=true --enable-merge-commit=false --enable-rebase-merge=false
+
+verify:
+  command: gh repo view anmho/<repo> --json nameWithOwner,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed
