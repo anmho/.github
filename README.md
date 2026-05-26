@@ -2,6 +2,13 @@
 
 Shared GitHub workflows and repository defaults for `anmho` repositories.
 
+## Dependabot
+
+Maintained ANM repositories should use the shared Dependabot policy in
+[`docs/dependabot-rollout.md`](docs/dependabot-rollout.md). The reusable
+template lives at
+[`templates/dependabot/maintained-repo.yml`](templates/dependabot/maintained-repo.yml).
+
 ## Reusable Workflows
 
 ### Linear PR Sync
